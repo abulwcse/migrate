@@ -10,6 +10,9 @@ import (
 	"io"
 	nurl "net/url"
 
+	"github.com/XSAM/otelsql"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database"
 	"github.com/hashicorp/go-multierror"
@@ -81,7 +84,14 @@ func (f *Firebird) Open(ctx context.Context, dsn string) (database.Driver, error
 		return nil, err
 	}
 
-	db, err := sql.Open("firebirdsql", migrate.FilterCustomQuery(purl).String())
+	db, err := otelsql.Open("firebirdsql", migrate.FilterCustomQuery(purl).String(),
+		otelsql.WithAttributes(semconv.DBSystemFirebird))
+	if err != nil {
+		return nil, err
+	}
+
+	err = otelsql.RegisterDBStatsMetrics(db,
+		otelsql.WithAttributes(semconv.DBSystemFirebird))
 	if err != nil {
 		return nil, err
 	}

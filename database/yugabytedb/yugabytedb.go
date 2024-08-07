@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"github.com/XSAM/otelsql"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"io"
 	"net/url"
 	"regexp"
@@ -108,7 +110,7 @@ func WithInstance(ctx context.Context, instance *sql.DB, config *Config) (databa
 	}
 
 	// ensureVersionTable is a locking operation, so we need to ensureLockTable before we ensureVersionTable.
-	if err := px.ensureLockTable(); err != nil {
+	if err := px.ensureLockTable(ctx); err != nil {
 		return nil, err
 	}
 
@@ -130,7 +132,14 @@ func (c *YugabyteDB) Open(ctx context.Context, dbURL string) (database.Driver, e
 	re := regexp.MustCompile("^(yugabyte(db)?|ysql)")
 	connectString := re.ReplaceAllString(migrate.FilterCustomQuery(purl).String(), "postgres")
 
-	db, err := sql.Open("postgres", connectString)
+	db, err := otelsql.Open("postgres", connectString,
+		otelsql.WithAttributes(semconv.DBSystemKey.String("yugabytedb")))
+	if err != nil {
+		return nil, err
+	}
+
+	err = otelsql.RegisterDBStatsMetrics(db,
+		otelsql.WithAttributes(semconv.DBSystemKey.String("yugabytedb")))
 	if err != nil {
 		return nil, err
 	}
@@ -193,14 +202,14 @@ func (c *YugabyteDB) Close(ctx context.Context) error {
 // See: https://github.com/yugabyte/yugabyte-db/issues/3642
 func (c *YugabyteDB) Lock(ctx context.Context) error {
 	return database.CasRestoreOnErr(&c.isLocked, false, true, database.ErrLocked, func() (err error) {
-		return c.doTxWithRetry(context.Background(), &sql.TxOptions{Isolation: sql.LevelSerializable}, func(tx *sql.Tx) (err error) {
+		return c.doTxWithRetry(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable}, func(tx *sql.Tx) (err error) {
 			aid, err := database.GenerateAdvisoryLockId(c.config.DatabaseName)
 			if err != nil {
 				return err
 			}
 
 			query := "SELECT * FROM " + c.config.LockTable + " WHERE lock_id = $1"
-			rows, err := tx.Query(query, aid)
+			rows, err := tx.QueryContext(ctx, query, aid)
 			if err != nil {
 				return database.Error{OrigErr: err, Err: "failed to fetch migration lock", Query: []byte(query)}
 			}
@@ -217,7 +226,7 @@ func (c *YugabyteDB) Lock(ctx context.Context) error {
 			}
 
 			query = "INSERT INTO " + c.config.LockTable + " (lock_id) VALUES ($1)"
-			if _, err := tx.Exec(query, aid); err != nil {
+			if _, err := tx.ExecContext(ctx, query, aid); err != nil {
 				return database.Error{OrigErr: err, Err: "failed to set migration lock", Query: []byte(query)}
 			}
 
@@ -238,7 +247,7 @@ func (c *YugabyteDB) Unlock(ctx context.Context) error {
 		// In the event of an implementation (non-migration) error, it is possible for the lock to not be released. Until
 		// a better locking mechanism is added, a manual purging of the lock table may be required in such circumstances
 		query := "DELETE FROM " + c.config.LockTable + " WHERE lock_id = $1"
-		if _, err := c.db.Exec(query, aid); err != nil {
+		if _, err := c.db.ExecContext(ctx, query, aid); err != nil {
 			if e, ok := err.(*pq.Error); ok {
 				// 42P01 is "UndefinedTableError" in YugabyteDB
 				// https://github.com/yugabyte/yugabyte-db/blob/9c6b8e6beb56eed8eeb357178c0c6b837eb49896/src/postgres/src/backend/utils/errcodes.txt#L366
@@ -263,7 +272,7 @@ func (c *YugabyteDB) Run(ctx context.Context, migration io.Reader) error {
 
 	// run migration
 	query := string(migr[:])
-	if _, err := c.db.Exec(query); err != nil {
+	if _, err := c.db.ExecContext(ctx, query); err != nil {
 		return database.Error{OrigErr: err, Err: "migration failed", Query: migr}
 	}
 
@@ -271,8 +280,8 @@ func (c *YugabyteDB) Run(ctx context.Context, migration io.Reader) error {
 }
 
 func (c *YugabyteDB) SetVersion(ctx context.Context, version int, dirty bool) error {
-	return c.doTxWithRetry(context.Background(), &sql.TxOptions{Isolation: sql.LevelSerializable}, func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`DELETE FROM "` + c.config.MigrationsTable + `"`); err != nil {
+	return c.doTxWithRetry(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable}, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM "`+c.config.MigrationsTable+`"`); err != nil {
 			return err
 		}
 
@@ -280,7 +289,7 @@ func (c *YugabyteDB) SetVersion(ctx context.Context, version int, dirty bool) er
 		// empty schema version for failed down migration on the first migration
 		// See: https://github.com/golang-migrate/migrate/issues/330
 		if version >= 0 || (version == database.NilVersion && dirty) {
-			if _, err := tx.Exec(`INSERT INTO "`+c.config.MigrationsTable+`" (version, dirty) VALUES ($1, $2)`, version, dirty); err != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO "`+c.config.MigrationsTable+`" (version, dirty) VALUES ($1, $2)`, version, dirty); err != nil {
 				return err
 			}
 		}
@@ -314,7 +323,7 @@ func (c *YugabyteDB) Version(ctx context.Context) (version int, dirty bool, err 
 
 func (c *YugabyteDB) Drop(ctx context.Context) (err error) {
 	query := `SELECT table_name FROM information_schema.tables WHERE table_schema=(SELECT current_schema()) AND table_type='BASE TABLE'`
-	tables, err := c.db.Query(query)
+	tables, err := c.db.QueryContext(ctx, query)
 	if err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
@@ -342,7 +351,7 @@ func (c *YugabyteDB) Drop(ctx context.Context) (err error) {
 	if len(tableNames) > 0 {
 		for _, t := range tableNames {
 			query = `DROP TABLE IF EXISTS ` + t + ` CASCADE`
-			if _, err := c.db.Exec(query); err != nil {
+			if _, err := c.db.ExecContext(ctx, query); err != nil {
 				return &database.Error{OrigErr: err, Query: []byte(query)}
 			}
 		}
@@ -380,13 +389,13 @@ func (c *YugabyteDB) ensureVersionTable(ctx context.Context) (err error) {
 
 	// if not, create the empty migration table
 	query = `CREATE TABLE "` + c.config.MigrationsTable + `" (version INT NOT NULL PRIMARY KEY, dirty BOOL NOT NULL)`
-	if _, err := c.db.Exec(query); err != nil {
+	if _, err := c.db.ExecContext(ctx, query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
 	return nil
 }
 
-func (c *YugabyteDB) ensureLockTable() error {
+func (c *YugabyteDB) ensureLockTable(ctx context.Context) error {
 	// check if lock table exists
 	var count int
 	query := `SELECT COUNT(1) FROM information_schema.tables WHERE table_name = $1 AND table_schema = (SELECT current_schema()) LIMIT 1`
@@ -399,7 +408,7 @@ func (c *YugabyteDB) ensureLockTable() error {
 
 	// if not, create the empty lock table
 	query = `CREATE TABLE "` + c.config.LockTable + `" (lock_id TEXT NOT NULL PRIMARY KEY)`
-	if _, err := c.db.Exec(query); err != nil {
+	if _, err := c.db.ExecContext(ctx, query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
 

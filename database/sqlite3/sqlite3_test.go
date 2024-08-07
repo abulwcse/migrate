@@ -91,7 +91,7 @@ func TestMigrationTable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = db.Query(fmt.Sprintf("SELECT * FROM %s", config.MigrationsTable))
+	_, err = db.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s", config.MigrationsTable))
 	if err != nil {
 		t.Fatal(err)
 	}

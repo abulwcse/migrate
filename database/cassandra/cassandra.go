@@ -173,7 +173,7 @@ func (c *Cassandra) Open(ctx context.Context, url string) (database.Driver, erro
 		}
 	}
 
-	session, err := cluster.CreateSession()
+	session, err := otelgocql.NewSessionWithTracing(ctx, cluster)
 	if err != nil {
 		return nil, err
 	}

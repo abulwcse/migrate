@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/XSAM/otelsql"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"io"
 	nurl "net/url"
 	"strconv"
@@ -102,7 +104,7 @@ func WithInstance(ctx context.Context, instance *sql.DB, config *Config) (databa
 		config.MigrationsTable = DefaultMigrationsTable
 	}
 
-	conn, err := instance.Conn(context.Background())
+	conn, err := instance.Conn(ctx)
 
 	if err != nil {
 		return nil, err
@@ -157,13 +159,20 @@ func (ss *SQLServer) Open(ctx context.Context, url string) (database.Driver, err
 			return nil, err
 		}
 
-		db = sql.OpenDB(connector)
+		db = otelsql.OpenDB(connector, otelsql.WithAttributes(semconv.DBSystemMSSQL))
 
 	} else {
-		db, err = sql.Open("sqlserver", filteredURL)
+		db, err = otelsql.Open("sqlserver", filteredURL,
+			otelsql.WithAttributes(semconv.DBSystemMSSQL))
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	err = otelsql.RegisterDBStatsMetrics(db,
+		otelsql.WithAttributes(semconv.DBSystemMSSQL))
+	if err != nil {
+		return nil, err
 	}
 
 	migrationsTable := purl.Query().Get("x-migrations-table")
@@ -204,7 +213,7 @@ func (ss *SQLServer) Lock(ctx context.Context) error {
 		query := `EXEC sp_getapplock @Resource = @p1, @LockMode = 'Update', @LockOwner = 'Session', @LockTimeout = 0`
 
 		var status mssql.ReturnStatus
-		if _, err = ss.conn.ExecContext(context.Background(), query, aid, &status); err == nil && status > -1 {
+		if _, err = ss.conn.ExecContext(ctx, query, aid, &status); err == nil && status > -1 {
 			return nil
 		} else if err != nil {
 			return &database.Error{OrigErr: err, Err: "try lock failed", Query: []byte(query)}
@@ -224,7 +233,7 @@ func (ss *SQLServer) Unlock(ctx context.Context) error {
 
 		// MS Docs: sp_releaseapplock: https://docs.microsoft.com/en-us/sql/relational-databases/system-stored-procedures/sp-releaseapplock-transact-sql?view=sql-server-2017
 		query := `EXEC sp_releaseapplock @Resource = @p1, @LockOwner = 'Session'`
-		if _, err := ss.conn.ExecContext(context.Background(), query, aid); err != nil {
+		if _, err := ss.conn.ExecContext(ctx, query, aid); err != nil {
 			return &database.Error{OrigErr: err, Query: []byte(query)}
 		}
 
@@ -241,7 +250,7 @@ func (ss *SQLServer) Run(ctx context.Context, migration io.Reader) error {
 
 	// run migration
 	query := string(migr[:])
-	if _, err := ss.conn.ExecContext(context.Background(), query); err != nil {
+	if _, err := ss.conn.ExecContext(ctx, query); err != nil {
 		if msErr, ok := err.(mssql.Error); ok {
 			message := fmt.Sprintf("migration failed: %s", msErr.Message)
 			if msErr.ProcName != "" {
@@ -258,13 +267,13 @@ func (ss *SQLServer) Run(ctx context.Context, migration io.Reader) error {
 // SetVersion for the current database
 func (ss *SQLServer) SetVersion(ctx context.Context, version int, dirty bool) error {
 
-	tx, err := ss.conn.BeginTx(context.Background(), &sql.TxOptions{})
+	tx, err := ss.conn.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return &database.Error{OrigErr: err, Err: "transaction start failed"}
 	}
 
 	query := `TRUNCATE TABLE ` + ss.getMigrationTable()
-	if _, err := tx.Exec(query); err != nil {
+	if _, err := tx.ExecContext(ctx, query); err != nil {
 		if errRollback := tx.Rollback(); errRollback != nil {
 			err = multierror.Append(err, errRollback)
 		}
@@ -280,7 +289,7 @@ func (ss *SQLServer) SetVersion(ctx context.Context, version int, dirty bool) er
 			dirtyBit = 1
 		}
 		query = `INSERT INTO ` + ss.getMigrationTable() + ` (version, dirty) VALUES (@p1, @p2)`
-		if _, err := tx.Exec(query, version, dirtyBit); err != nil {
+		if _, err := tx.ExecContext(ctx, query, version, dirtyBit); err != nil {
 			if errRollback := tx.Rollback(); errRollback != nil {
 				err = multierror.Append(err, errRollback)
 			}
@@ -298,7 +307,7 @@ func (ss *SQLServer) SetVersion(ctx context.Context, version int, dirty bool) er
 // Version of the current database state
 func (ss *SQLServer) Version(ctx context.Context) (version int, dirty bool, err error) {
 	query := `SELECT TOP 1 version, dirty FROM ` + ss.getMigrationTable()
-	err = ss.conn.QueryRowContext(context.Background(), query).Scan(&version, &dirty)
+	err = ss.conn.QueryRowContext(ctx, query).Scan(&version, &dirty)
 	switch {
 	case err == sql.ErrNoRows:
 		return database.NilVersion, false, nil
@@ -334,13 +343,13 @@ func (ss *SQLServer) Drop(ctx context.Context) error {
 
 	CLOSE @Cursor DEALLOCATE @Cursor`
 
-	if _, err := ss.conn.ExecContext(context.Background(), query); err != nil {
+	if _, err := ss.conn.ExecContext(ctx, query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
 
 	// drop the tables
 	query = `EXEC sp_MSforeachtable 'DROP TABLE ?'`
-	if _, err := ss.conn.ExecContext(context.Background(), query); err != nil {
+	if _, err := ss.conn.ExecContext(ctx, query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
 
@@ -370,7 +379,7 @@ func (ss *SQLServer) ensureVersionTable(ctx context.Context) (err error) {
 	)
 	CREATE TABLE ` + ss.getMigrationTable() + ` ( version BIGINT PRIMARY KEY NOT NULL, dirty BIT NOT NULL );`
 
-	if _, err = ss.conn.ExecContext(context.Background(), query); err != nil {
+	if _, err = ss.conn.ExecContext(ctx, query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
 

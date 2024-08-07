@@ -9,6 +9,8 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"fmt"
+	"github.com/XSAM/otelsql"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"io"
 	nurl "net/url"
 	"os"
@@ -251,7 +253,14 @@ func (m *Mysql) Open(ctx context.Context, url string) (database.Driver, error) {
 		}
 	}
 
-	db, err := sql.Open("mysql", config.FormatDSN())
+	db, err := otelsql.Open("mysql", config.FormatDSN(),
+		otelsql.WithAttributes(semconv.DBSystemMySQL))
+	if err != nil {
+		return nil, err
+	}
+
+	err = otelsql.RegisterDBStatsMetrics(db,
+		otelsql.WithAttributes(semconv.DBSystemMySQL))
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +304,7 @@ func (m *Mysql) Lock(ctx context.Context) error {
 
 		query := "SELECT GET_LOCK(?, 10)"
 		var success bool
-		if err := m.conn.QueryRowContext(context.Background(), query, aid).Scan(&success); err != nil {
+		if err := m.conn.QueryRowContext(ctx, query, aid).Scan(&success); err != nil {
 			return &database.Error{OrigErr: err, Err: "try lock failed", Query: []byte(query)}
 		}
 
@@ -320,7 +329,7 @@ func (m *Mysql) Unlock(ctx context.Context) error {
 		}
 
 		query := `SELECT RELEASE_LOCK(?)`
-		if _, err := m.conn.ExecContext(context.Background(), query, aid); err != nil {
+		if _, err := m.conn.ExecContext(ctx, query, aid); err != nil {
 			return &database.Error{OrigErr: err, Query: []byte(query)}
 		}
 
@@ -353,13 +362,13 @@ func (m *Mysql) Run(ctx context.Context, migration io.Reader) error {
 }
 
 func (m *Mysql) SetVersion(ctx context.Context, version int, dirty bool) error {
-	tx, err := m.conn.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelSerializable})
+	tx, err := m.conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return &database.Error{OrigErr: err, Err: "transaction start failed"}
 	}
 
 	query := "DELETE FROM `" + m.config.MigrationsTable + "` LIMIT 1"
-	if _, err := tx.ExecContext(context.Background(), query); err != nil {
+	if _, err := tx.ExecContext(ctx, query); err != nil {
 		if errRollback := tx.Rollback(); errRollback != nil {
 			err = multierror.Append(err, errRollback)
 		}
@@ -371,7 +380,7 @@ func (m *Mysql) SetVersion(ctx context.Context, version int, dirty bool) error {
 	// See: https://github.com/golang-migrate/migrate/issues/330
 	if version >= 0 || (version == database.NilVersion && dirty) {
 		query := "INSERT INTO `" + m.config.MigrationsTable + "` (version, dirty) VALUES (?, ?)"
-		if _, err := tx.ExecContext(context.Background(), query, version, dirty); err != nil {
+		if _, err := tx.ExecContext(ctx, query, version, dirty); err != nil {
 			if errRollback := tx.Rollback(); errRollback != nil {
 				err = multierror.Append(err, errRollback)
 			}
@@ -388,7 +397,7 @@ func (m *Mysql) SetVersion(ctx context.Context, version int, dirty bool) error {
 
 func (m *Mysql) Version(ctx context.Context) (version int, dirty bool, err error) {
 	query := "SELECT version, dirty FROM `" + m.config.MigrationsTable + "` LIMIT 1"
-	err = m.conn.QueryRowContext(context.Background(), query).Scan(&version, &dirty)
+	err = m.conn.QueryRowContext(ctx, query).Scan(&version, &dirty)
 	switch {
 	case err == sql.ErrNoRows:
 		return database.NilVersion, false, nil
@@ -409,7 +418,7 @@ func (m *Mysql) Version(ctx context.Context) (version int, dirty bool, err error
 func (m *Mysql) Drop(ctx context.Context) (err error) {
 	// select all tables
 	query := `SHOW TABLES LIKE '%'`
-	tables, err := m.conn.QueryContext(context.Background(), query)
+	tables, err := m.conn.QueryContext(ctx, query)
 	if err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
@@ -437,19 +446,19 @@ func (m *Mysql) Drop(ctx context.Context) (err error) {
 	if len(tableNames) > 0 {
 		// disable checking foreign key constraints until finished
 		query = `SET foreign_key_checks = 0`
-		if _, err := m.conn.ExecContext(context.Background(), query); err != nil {
+		if _, err := m.conn.ExecContext(ctx, query); err != nil {
 			return &database.Error{OrigErr: err, Query: []byte(query)}
 		}
 
 		defer func() {
 			// enable foreign key checks
-			_, _ = m.conn.ExecContext(context.Background(), `SET foreign_key_checks = 1`)
+			_, _ = m.conn.ExecContext(ctx, `SET foreign_key_checks = 1`)
 		}()
 
 		// delete one by one ...
 		for _, t := range tableNames {
 			query = "DROP TABLE IF EXISTS `" + t + "`"
-			if _, err := m.conn.ExecContext(context.Background(), query); err != nil {
+			if _, err := m.conn.ExecContext(ctx, query); err != nil {
 				return &database.Error{OrigErr: err, Query: []byte(query)}
 			}
 		}
@@ -479,7 +488,7 @@ func (m *Mysql) ensureVersionTable(ctx context.Context) (err error) {
 	// check if migration table exists
 	var result string
 	query := `SHOW TABLES LIKE '` + m.config.MigrationsTable + `'`
-	if err := m.conn.QueryRowContext(context.Background(), query).Scan(&result); err != nil {
+	if err := m.conn.QueryRowContext(ctx, query).Scan(&result); err != nil {
 		if err != sql.ErrNoRows {
 			return &database.Error{OrigErr: err, Query: []byte(query)}
 		}
@@ -489,7 +498,7 @@ func (m *Mysql) ensureVersionTable(ctx context.Context) (err error) {
 
 	// if not, create the empty migration table
 	query = "CREATE TABLE `" + m.config.MigrationsTable + "` (version bigint not null primary key, dirty boolean not null)"
-	if _, err := m.conn.ExecContext(context.Background(), query); err != nil {
+	if _, err := m.conn.ExecContext(ctx, query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
 	return nil

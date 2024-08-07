@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/XSAM/otelsql"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"io"
 	nurl "net/url"
 	"strconv"
@@ -87,7 +89,7 @@ func (m *Sqlite) ensureVersionTable(ctx context.Context) (err error) {
   CREATE UNIQUE INDEX IF NOT EXISTS version_unique ON %s (version);
   `, m.config.MigrationsTable, m.config.MigrationsTable)
 
-	if _, err := m.db.Exec(query); err != nil {
+	if _, err := m.db.ExecContext(ctx, query); err != nil {
 		return err
 	}
 	return nil
@@ -99,7 +101,14 @@ func (m *Sqlite) Open(ctx context.Context, url string) (database.Driver, error) 
 		return nil, err
 	}
 	dbfile := strings.Replace(migrate.FilterCustomQuery(purl).String(), "sqlite://", "", 1)
-	db, err := sql.Open("sqlite", dbfile)
+	db, err := otelsql.Open("sqlite", dbfile,
+		otelsql.WithAttributes(semconv.DBSystemSqlite))
+	if err != nil {
+		return nil, err
+	}
+
+	err = otelsql.RegisterDBStatsMetrics(db,
+		otelsql.WithAttributes(semconv.DBSystemSqlite))
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +145,7 @@ func (m *Sqlite) Close(ctx context.Context) error {
 
 func (m *Sqlite) Drop(ctx context.Context) (err error) {
 	query := `SELECT name FROM sqlite_master WHERE type = 'table';`
-	tables, err := m.db.Query(query)
+	tables, err := m.db.QueryContext(ctx, query)
 	if err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
@@ -163,13 +172,13 @@ func (m *Sqlite) Drop(ctx context.Context) (err error) {
 	if len(tableNames) > 0 {
 		for _, t := range tableNames {
 			query := "DROP TABLE " + t
-			err = m.executeQuery(query)
+			err = m.executeQuery(ctx, query)
 			if err != nil {
 				return &database.Error{OrigErr: err, Query: []byte(query)}
 			}
 		}
 		query := "VACUUM"
-		_, err = m.db.Query(query)
+		_, err = m.db.QueryContext(ctx, query)
 		if err != nil {
 			return &database.Error{OrigErr: err, Query: []byte(query)}
 		}
@@ -200,17 +209,17 @@ func (m *Sqlite) Run(ctx context.Context, migration io.Reader) error {
 	query := string(migr[:])
 
 	if m.config.NoTxWrap {
-		return m.executeQueryNoTx(query)
+		return m.executeQueryNoTx(ctx, query)
 	}
-	return m.executeQuery(query)
+	return m.executeQuery(ctx, query)
 }
 
-func (m *Sqlite) executeQuery(query string) error {
-	tx, err := m.db.Begin()
+func (m *Sqlite) executeQuery(ctx context.Context, query string) error {
+	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return &database.Error{OrigErr: err, Err: "transaction start failed"}
 	}
-	if _, err := tx.Exec(query); err != nil {
+	if _, err := tx.ExecContext(ctx, query); err != nil {
 		if errRollback := tx.Rollback(); errRollback != nil {
 			err = multierror.Append(err, errRollback)
 		}
@@ -222,21 +231,21 @@ func (m *Sqlite) executeQuery(query string) error {
 	return nil
 }
 
-func (m *Sqlite) executeQueryNoTx(query string) error {
-	if _, err := m.db.Exec(query); err != nil {
+func (m *Sqlite) executeQueryNoTx(ctx context.Context, query string) error {
+	if _, err := m.db.ExecContext(ctx, query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
 	return nil
 }
 
 func (m *Sqlite) SetVersion(ctx context.Context, version int, dirty bool) error {
-	tx, err := m.db.Begin()
+	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return &database.Error{OrigErr: err, Err: "transaction start failed"}
 	}
 
 	query := "DELETE FROM " + m.config.MigrationsTable
-	if _, err := tx.Exec(query); err != nil {
+	if _, err := tx.ExecContext(ctx, query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
 
@@ -245,7 +254,7 @@ func (m *Sqlite) SetVersion(ctx context.Context, version int, dirty bool) error 
 	// See: https://github.com/golang-migrate/migrate/issues/330
 	if version >= 0 || (version == database.NilVersion && dirty) {
 		query := fmt.Sprintf(`INSERT INTO %s (version, dirty) VALUES (?, ?)`, m.config.MigrationsTable)
-		if _, err := tx.Exec(query, version, dirty); err != nil {
+		if _, err := tx.ExecContext(ctx, query, version, dirty); err != nil {
 			if errRollback := tx.Rollback(); errRollback != nil {
 				err = multierror.Append(err, errRollback)
 			}
@@ -262,7 +271,7 @@ func (m *Sqlite) SetVersion(ctx context.Context, version int, dirty bool) error 
 
 func (m *Sqlite) Version(ctx context.Context) (version int, dirty bool, err error) {
 	query := "SELECT version, dirty FROM " + m.config.MigrationsTable + " LIMIT 1"
-	err = m.db.QueryRow(query).Scan(&version, &dirty)
+	err = m.db.QueryRowContext(ctx, query).Scan(&version, &dirty)
 	if err != nil {
 		return database.NilVersion, false, nil
 	}

@@ -79,7 +79,7 @@ func createDB(t *testing.T, c dktest.ContainerInfo) {
 		}
 	}()
 
-	if _, err = db.Exec("CREATE DATABASE migrate"); err != nil {
+	if _, err = db.ExecContext(context.Background(), "CREATE DATABASE migrate"); err != nil {
 		t.Fatal(err)
 	}
 }

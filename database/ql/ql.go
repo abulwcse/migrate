@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/XSAM/otelsql"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"io"
 	nurl "net/url"
 	"strings"
@@ -81,11 +83,11 @@ func (m *Ql) ensureVersionTable(ctx context.Context) (err error) {
 		}
 	}()
 
-	tx, err := m.db.Begin()
+	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(fmt.Sprintf(`
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 	CREATE TABLE IF NOT EXISTS %s (version uint64, dirty bool);
 	CREATE UNIQUE INDEX IF NOT EXISTS version_unique ON %s (version);
 `, m.config.MigrationsTable, m.config.MigrationsTable)); err != nil {
@@ -106,10 +108,18 @@ func (m *Ql) Open(ctx context.Context, url string) (database.Driver, error) {
 		return nil, err
 	}
 	dbfile := strings.Replace(migrate.FilterCustomQuery(purl).String(), "ql://", "", 1)
-	db, err := sql.Open("ql", dbfile)
+	db, err := otelsql.Open("ql", dbfile,
+		otelsql.WithAttributes(semconv.DBSystemKey.String("ql")))
 	if err != nil {
 		return nil, err
 	}
+
+	err = otelsql.RegisterDBStatsMetrics(db,
+		otelsql.WithAttributes(semconv.DBSystemKey.String("ql")))
+	if err != nil {
+		return nil, err
+	}
+
 	migrationsTable := purl.Query().Get("x-migrations-table")
 	if len(migrationsTable) == 0 {
 		migrationsTable = DefaultMigrationsTable
@@ -128,7 +138,7 @@ func (m *Ql) Close(ctx context.Context) error {
 }
 func (m *Ql) Drop(ctx context.Context) (err error) {
 	query := `SELECT Name FROM __Table`
-	tables, err := m.db.Query(query)
+	tables, err := m.db.QueryContext(ctx, query)
 	if err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
@@ -157,7 +167,7 @@ func (m *Ql) Drop(ctx context.Context) (err error) {
 	if len(tableNames) > 0 {
 		for _, t := range tableNames {
 			query := "DROP TABLE " + t
-			err = m.executeQuery(query)
+			err = m.executeQuery(ctx, query)
 			if err != nil {
 				return &database.Error{OrigErr: err, Query: []byte(query)}
 			}
@@ -185,14 +195,14 @@ func (m *Ql) Run(ctx context.Context, migration io.Reader) error {
 	}
 	query := string(migr[:])
 
-	return m.executeQuery(query)
+	return m.executeQuery(ctx, query)
 }
-func (m *Ql) executeQuery(query string) error {
-	tx, err := m.db.Begin()
+func (m *Ql) executeQuery(ctx context.Context, query string) error {
+	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return &database.Error{OrigErr: err, Err: "transaction start failed"}
 	}
-	if _, err := tx.Exec(query); err != nil {
+	if _, err := tx.ExecContext(ctx, query); err != nil {
 		if errRollback := tx.Rollback(); errRollback != nil {
 			err = multierror.Append(err, errRollback)
 		}
@@ -204,13 +214,13 @@ func (m *Ql) executeQuery(query string) error {
 	return nil
 }
 func (m *Ql) SetVersion(ctx context.Context, version int, dirty bool) error {
-	tx, err := m.db.Begin()
+	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return &database.Error{OrigErr: err, Err: "transaction start failed"}
 	}
 
 	query := "TRUNCATE TABLE " + m.config.MigrationsTable
-	if _, err := tx.Exec(query); err != nil {
+	if _, err := tx.ExecContext(ctx, query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
 
@@ -220,7 +230,7 @@ func (m *Ql) SetVersion(ctx context.Context, version int, dirty bool) error {
 	if version >= 0 || (version == database.NilVersion && dirty) {
 		query := fmt.Sprintf(`INSERT INTO %s (version, dirty) VALUES (uint64(?1), ?2)`,
 			m.config.MigrationsTable)
-		if _, err := tx.Exec(query, version, dirty); err != nil {
+		if _, err := tx.ExecContext(ctx, query, version, dirty); err != nil {
 			if errRollback := tx.Rollback(); errRollback != nil {
 				err = multierror.Append(err, errRollback)
 			}

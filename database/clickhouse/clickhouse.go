@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/XSAM/otelsql"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"io"
 	"net/url"
 	"strconv"
@@ -75,7 +77,14 @@ func (ch *ClickHouse) Open(ctx context.Context, dsn string) (database.Driver, er
 	}
 	q := migrate.FilterCustomQuery(purl)
 	q.Scheme = "tcp"
-	conn, err := sql.Open("clickhouse", q.String())
+	conn, err := otelsql.Open("clickhouse", q.String(),
+		otelsql.WithAttributes(semconv.DBSystemClickhouse))
+	if err != nil {
+		return nil, err
+	}
+
+	err = otelsql.RegisterDBStatsMetrics(conn,
+		otelsql.WithAttributes(semconv.DBSystemClickhouse))
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +151,7 @@ func (ch *ClickHouse) Run(ctx context.Context, r io.Reader) error {
 			if tq == "" {
 				return true
 			}
-			if _, e := ch.conn.Exec(string(m)); e != nil {
+			if _, e := ch.conn.ExecContext(ctx, string(m)); e != nil {
 				err = database.Error{OrigErr: e, Err: "migration failed", Query: m}
 				return false
 			}
@@ -158,7 +167,7 @@ func (ch *ClickHouse) Run(ctx context.Context, r io.Reader) error {
 		return err
 	}
 
-	if _, err := ch.conn.Exec(string(migration)); err != nil {
+	if _, err := ch.conn.ExecContext(ctx, string(migration)); err != nil {
 		return database.Error{OrigErr: err, Err: "migration failed", Query: migration}
 	}
 
@@ -187,14 +196,14 @@ func (ch *ClickHouse) SetVersion(ctx context.Context, version int, dirty bool) e
 			}
 			return 0
 		}
-		tx, err = ch.conn.Begin()
+		tx, err = ch.conn.BeginTx(ctx, nil)
 	)
 	if err != nil {
 		return err
 	}
 
 	query := "INSERT INTO " + ch.config.MigrationsTable + " (version, dirty, sequence) VALUES (?, ?, ?)"
-	if _, err := tx.Exec(query, version, bool(dirty), time.Now().UnixNano()); err != nil {
+	if _, err := tx.ExecContext(ctx, query, version, bool(dirty), time.Now().UnixNano()); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
 
@@ -253,7 +262,7 @@ func (ch *ClickHouse) ensureVersionTable(ctx context.Context) (err error) {
 		query = fmt.Sprintf(`%s ORDER BY sequence`, query)
 	}
 
-	if _, err := ch.conn.Exec(query); err != nil {
+	if _, err := ch.conn.ExecContext(ctx, query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
 	return nil
@@ -280,7 +289,7 @@ func (ch *ClickHouse) Drop(ctx context.Context) (err error) {
 
 		query = "DROP TABLE IF EXISTS " + quoteIdentifier(ch.config.DatabaseName) + "." + quoteIdentifier(table)
 
-		if _, err := ch.conn.Exec(query); err != nil {
+		if _, err := ch.conn.ExecContext(ctx, query); err != nil {
 			return &database.Error{OrigErr: err, Query: []byte(query)}
 		}
 	}

@@ -7,6 +7,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/XSAM/otelsql"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"io"
 	nurl "net/url"
 	"strconv"
@@ -73,7 +75,7 @@ func WithInstance(ctx context.Context, instance *sql.DB, config *Config) (databa
 		config.MigrationsTable = DefaultMigrationsTable
 	}
 
-	conn, err := instance.Conn(context.Background())
+	conn, err := instance.Conn(ctx)
 
 	if err != nil {
 		return nil, err
@@ -99,7 +101,14 @@ func (p *Redshift) Open(ctx context.Context, url string) (database.Driver, error
 	}
 	purl.Scheme = "postgres"
 
-	db, err := sql.Open("postgres", migrate.FilterCustomQuery(purl).String())
+	db, err := otelsql.Open("postgres", migrate.FilterCustomQuery(purl).String(),
+		otelsql.WithAttributes(semconv.DBSystemRedshift))
+	if err != nil {
+		return nil, err
+	}
+
+	err = otelsql.RegisterDBStatsMetrics(db,
+		otelsql.WithAttributes(semconv.DBSystemRedshift))
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +158,7 @@ func (p *Redshift) Run(ctx context.Context, migration io.Reader) error {
 
 	// run migration
 	query := string(migr[:])
-	if _, err := p.conn.ExecContext(context.Background(), query); err != nil {
+	if _, err := p.conn.ExecContext(ctx, query); err != nil {
 		if pgErr, ok := err.(*pq.Error); ok {
 			var line uint
 			var col uint
@@ -210,13 +219,13 @@ func runesLastIndex(input []rune, target rune) int {
 }
 
 func (p *Redshift) SetVersion(ctx context.Context, version int, dirty bool) error {
-	tx, err := p.conn.BeginTx(context.Background(), &sql.TxOptions{})
+	tx, err := p.conn.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return &database.Error{OrigErr: err, Err: "transaction start failed"}
 	}
 
 	query := `DELETE FROM "` + p.config.MigrationsTable + `"`
-	if _, err := tx.Exec(query); err != nil {
+	if _, err := tx.ExecContext(ctx, query); err != nil {
 		if errRollback := tx.Rollback(); errRollback != nil {
 			err = multierror.Append(err, errRollback)
 		}
@@ -228,7 +237,7 @@ func (p *Redshift) SetVersion(ctx context.Context, version int, dirty bool) erro
 	// See: https://github.com/golang-migrate/migrate/issues/330
 	if version >= 0 || (version == database.NilVersion && dirty) {
 		query = `INSERT INTO "` + p.config.MigrationsTable + `" (version, dirty) VALUES ($1, $2)`
-		if _, err := tx.Exec(query, version, dirty); err != nil {
+		if _, err := tx.ExecContext(ctx, query, version, dirty); err != nil {
 			if errRollback := tx.Rollback(); errRollback != nil {
 				err = multierror.Append(err, errRollback)
 			}
@@ -245,7 +254,7 @@ func (p *Redshift) SetVersion(ctx context.Context, version int, dirty bool) erro
 
 func (p *Redshift) Version(ctx context.Context) (version int, dirty bool, err error) {
 	query := `SELECT version, dirty FROM "` + p.config.MigrationsTable + `" LIMIT 1`
-	err = p.conn.QueryRowContext(context.Background(), query).Scan(&version, &dirty)
+	err = p.conn.QueryRowContext(ctx, query).Scan(&version, &dirty)
 	switch {
 	case err == sql.ErrNoRows:
 		return database.NilVersion, false, nil
@@ -266,7 +275,7 @@ func (p *Redshift) Version(ctx context.Context) (version int, dirty bool, err er
 func (p *Redshift) Drop(ctx context.Context) (err error) {
 	// select all tables in current schema
 	query := `SELECT table_name FROM information_schema.tables WHERE table_schema=(SELECT current_schema()) AND table_type='BASE TABLE'`
-	tables, err := p.conn.QueryContext(context.Background(), query)
+	tables, err := p.conn.QueryContext(ctx, query)
 	if err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
@@ -295,7 +304,7 @@ func (p *Redshift) Drop(ctx context.Context) (err error) {
 		// delete one by one ...
 		for _, t := range tableNames {
 			query = `DROP TABLE IF EXISTS ` + t + ` CASCADE`
-			if _, err := p.conn.ExecContext(context.Background(), query); err != nil {
+			if _, err := p.conn.ExecContext(ctx, query); err != nil {
 				return &database.Error{OrigErr: err, Query: []byte(query)}
 			}
 		}
@@ -325,7 +334,7 @@ func (p *Redshift) ensureVersionTable(ctx context.Context) (err error) {
 	// check if migration table exists
 	var count int
 	query := `SELECT COUNT(1) FROM information_schema.tables WHERE table_name = $1 AND table_schema = (SELECT current_schema()) LIMIT 1`
-	if err := p.conn.QueryRowContext(context.Background(), query, p.config.MigrationsTable).Scan(&count); err != nil {
+	if err := p.conn.QueryRowContext(ctx, query, p.config.MigrationsTable).Scan(&count); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
 	if count == 1 {
@@ -334,7 +343,7 @@ func (p *Redshift) ensureVersionTable(ctx context.Context) (err error) {
 
 	// if not, create the empty migration table
 	query = `CREATE TABLE "` + p.config.MigrationsTable + `" (version bigint not null primary key, dirty boolean not null)`
-	if _, err := p.conn.ExecContext(context.Background(), query); err != nil {
+	if _, err := p.conn.ExecContext(ctx, query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
 	return nil
