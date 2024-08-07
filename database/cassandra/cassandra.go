@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gocql/gocql/otelgocql"
 	"io"
 	nurl "net/url"
 	"strconv"
