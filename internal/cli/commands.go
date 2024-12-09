@@ -13,6 +13,9 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/stub" // TODO remove again
 	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -73,8 +76,13 @@ func timeVersion(startTime time.Time, format string) (version string, err error)
 }
 
 // createCmd (meant to be called via a CLI command) creates a new migration
-func createCmd(dir string, startTime time.Time, format string, name string, ext string, seq bool, seqDigits int, print bool) error {
+func createCmd(ctx context.Context, dir string, startTime time.Time, format string, name string, ext string, seq bool, seqDigits int, print bool) error {
+	_, span := tracer.Start(ctx, "createCmd")
+	defer span.End()
+
 	if seq && format != defaultTimeFormat {
+		span.RecordError(errIncompatibleSeqAndFormat)
+		span.SetStatus(codes.Error, errIncompatibleSeqAndFormat.Error())
 		return errIncompatibleSeqAndFormat
 	}
 
@@ -88,18 +96,24 @@ func createCmd(dir string, startTime time.Time, format string, name string, ext 
 		matches, err := filepath.Glob(filepath.Join(dir, "*"+ext))
 
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return err
 		}
 
 		version, err = nextSeqVersion(matches, seqDigits)
 
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return err
 		}
 	} else {
 		version, err = timeVersion(startTime, format)
 
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return err
 		}
 	}
@@ -108,14 +122,21 @@ func createCmd(dir string, startTime time.Time, format string, name string, ext 
 	matches, err := filepath.Glob(versionGlob)
 
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
 	if len(matches) > 0 {
-		return fmt.Errorf("duplicate migration version: %s", version)
+		err := fmt.Errorf("duplicate migration version: %s", version)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
 	if err = os.MkdirAll(dir, os.ModePerm); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
@@ -124,6 +145,8 @@ func createCmd(dir string, startTime time.Time, format string, name string, ext 
 		filename := filepath.Join(dir, basename)
 
 		if err = createFile(filename); err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return err
 		}
 
@@ -149,8 +172,13 @@ func createFile(filename string) error {
 }
 
 func gotoCmd(ctx context.Context, m *migrate.Migrate, v uint) error {
+	ctx, span := tracer.Start(ctx, "gotoCmd", trace.WithAttributes(attribute.Int("v", int(v))))
+	defer span.End()
+
 	if err := m.Migrate(ctx, v); err != nil {
 		if err != migrate.ErrNoChange {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return err
 		}
 		log.Println(err)
@@ -159,9 +187,14 @@ func gotoCmd(ctx context.Context, m *migrate.Migrate, v uint) error {
 }
 
 func upCmd(ctx context.Context, m *migrate.Migrate, limit int) error {
+	ctx, span := tracer.Start(ctx, "upCmd", trace.WithAttributes(attribute.Int("limit", limit)))
+	defer span.End()
+
 	if limit >= 0 {
 		if err := m.Steps(ctx, limit); err != nil {
 			if err != migrate.ErrNoChange {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
 				return err
 			}
 			log.Println(err)
@@ -169,6 +202,8 @@ func upCmd(ctx context.Context, m *migrate.Migrate, limit int) error {
 	} else {
 		if err := m.Up(ctx); err != nil {
 			if err != migrate.ErrNoChange {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
 				return err
 			}
 			log.Println(err)
@@ -178,9 +213,14 @@ func upCmd(ctx context.Context, m *migrate.Migrate, limit int) error {
 }
 
 func downCmd(ctx context.Context, m *migrate.Migrate, limit int) error {
+	ctx, span := tracer.Start(ctx, "downCmd", trace.WithAttributes(attribute.Int("limit", limit)))
+	defer span.End()
+
 	if limit >= 0 {
 		if err := m.Steps(ctx, -limit); err != nil {
 			if err != migrate.ErrNoChange {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
 				return err
 			}
 			log.Println(err)
@@ -188,6 +228,8 @@ func downCmd(ctx context.Context, m *migrate.Migrate, limit int) error {
 	} else {
 		if err := m.Down(ctx); err != nil {
 			if err != migrate.ErrNoChange {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
 				return err
 			}
 			log.Println(err)
@@ -197,28 +239,46 @@ func downCmd(ctx context.Context, m *migrate.Migrate, limit int) error {
 }
 
 func dropCmd(ctx context.Context, m *migrate.Migrate) error {
+	ctx, span := tracer.Start(ctx, "dropCmd")
+	defer span.End()
+
 	if err := m.Drop(ctx); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 	return nil
 }
 
 func forceCmd(ctx context.Context, m *migrate.Migrate, v int) error {
+	ctx, span := tracer.Start(ctx, "forceCmd", trace.WithAttributes(attribute.Int("v", int(v))))
+	defer span.End()
+
 	if err := m.Force(ctx, v); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 	return nil
 }
 
 func versionCmd(ctx context.Context, m *migrate.Migrate) error {
+	ctx, span := tracer.Start(ctx, "versionCmd")
+	defer span.End()
+
 	v, dirty, err := m.Version(ctx)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 	if dirty {
 		log.Printf("%v (dirty)\n", v)
+		span.SetAttributes(attribute.Int("v", int(v)))
+		span.SetAttributes(attribute.Bool("dirty", true))
 	} else {
 		log.Println(v)
+		span.SetAttributes(attribute.Int("v", int(v)))
 	}
 	return nil
 }

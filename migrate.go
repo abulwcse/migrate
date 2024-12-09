@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-multierror"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/golang-migrate/migrate/v4/database"
 	iurl "github.com/golang-migrate/migrate/v4/internal/url"
@@ -35,6 +37,10 @@ var (
 	ErrInvalidVersion = errors.New("version must be >= -1")
 	ErrLocked         = errors.New("database locked")
 	ErrLockTimeout    = errors.New("timeout: can't acquire database lock")
+
+	MigrationIdentifierKey = attribute.Key("migrate.migration.identifier")
+	MigrationVersionKey    = attribute.Key("migrate.migration.version")
+	MigrationDirectionKey  = attribute.Key("migrate.migration.direction")
 )
 
 // ErrShortLimit is an error returned when not enough migrations
@@ -65,6 +71,8 @@ type Migrate struct {
 	// Log accepts a Logger interface
 	Log Logger
 
+	tracer trace.Tracer
+
 	// GracefulStop accepts `true` and will stop executing migrations
 	// as soon as possible at a safe break point, so that the database
 	// is not corrupted.
@@ -86,6 +94,8 @@ type Migrate struct {
 // New returns a new Migrate instance from a source URL and a database URL.
 // The URL scheme is defined by each driver.
 func New(ctx context.Context, sourceURL, databaseURL string) (*Migrate, error) {
+	span := trace.SpanFromContext(ctx)
+
 	m := newCommon()
 
 	sourceName, err := iurl.SchemeFromURL(sourceURL)
@@ -93,12 +103,14 @@ func New(ctx context.Context, sourceURL, databaseURL string) (*Migrate, error) {
 		return nil, fmt.Errorf("failed to parse scheme from source URL: %w", err)
 	}
 	m.sourceName = sourceName
+	span.SetAttributes(source.SourceDriverKey.String(sourceName))
 
 	databaseName, err := iurl.SchemeFromURL(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse scheme from database URL: %w", err)
 	}
 	m.databaseName = databaseName
+	span.SetAttributes(database.DatabaseDriverKey.String(databaseName))
 
 	sourceDrv, err := source.Open(ctx, sourceURL)
 	if err != nil {
@@ -115,11 +127,49 @@ func New(ctx context.Context, sourceURL, databaseURL string) (*Migrate, error) {
 	return m, nil
 }
 
+// New returns a new Migrate instance from a source URL and a database URL.
+// The URL scheme is defined by each driver.
+func NewInstrumented(ctx context.Context, tracer trace.Tracer, sourceURL, databaseURL string) (*Migrate, error) {
+	span := trace.SpanFromContext(ctx)
+
+	m := newCommon()
+
+	sourceName, err := iurl.SchemeFromURL(sourceURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse scheme from source URL: %w", err)
+	}
+	m.sourceName = sourceName
+	span.SetAttributes(source.SourceDriverKey.String(sourceName))
+
+	databaseName, err := iurl.SchemeFromURL(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse scheme from database URL: %w", err)
+	}
+	m.databaseName = databaseName
+	span.SetAttributes(database.DatabaseDriverKey.String(databaseName))
+
+	sourceDrv, err := source.OpenInstrumented(ctx, tracer, sourceURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open source, %q: %w", sourceURL, err)
+	}
+	m.sourceDrv = sourceDrv
+
+	databaseDrv, err := database.OpenInstrumented(ctx, tracer, databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+	m.databaseDrv = databaseDrv
+
+	return m, nil
+}
+
 // NewWithDatabaseInstance returns a new Migrate instance from a source URL
 // and an existing database instance. The source URL scheme is defined by each driver.
 // Use any string that can serve as an identifier during logging as databaseName.
 // You are responsible for closing the underlying database client if necessary.
 func NewWithDatabaseInstance(ctx context.Context, sourceURL string, databaseName string, databaseInstance database.Driver) (*Migrate, error) {
+	span := trace.SpanFromContext(ctx)
+
 	m := newCommon()
 
 	sourceName, err := iurl.SchemeFromURL(sourceURL)
@@ -127,8 +177,10 @@ func NewWithDatabaseInstance(ctx context.Context, sourceURL string, databaseName
 		return nil, err
 	}
 	m.sourceName = sourceName
+	span.SetAttributes(source.SourceDriverKey.String(sourceName))
 
 	m.databaseName = databaseName
+	span.SetAttributes(database.DatabaseDriverKey.String(databaseName))
 
 	sourceDrv, err := source.Open(ctx, sourceURL)
 	if err != nil {
@@ -146,6 +198,7 @@ func NewWithDatabaseInstance(ctx context.Context, sourceURL string, databaseName
 // Use any string that can serve as an identifier during logging as sourceName.
 // You are responsible for closing the underlying source client if necessary.
 func NewWithSourceInstance(ctx context.Context, sourceName string, sourceInstance source.Driver, databaseURL string) (*Migrate, error) {
+	span := trace.SpanFromContext(ctx)
 	m := newCommon()
 
 	databaseName, err := iurl.SchemeFromURL(databaseURL)
@@ -153,8 +206,10 @@ func NewWithSourceInstance(ctx context.Context, sourceName string, sourceInstanc
 		return nil, fmt.Errorf("failed to parse scheme from database URL: %w", err)
 	}
 	m.databaseName = databaseName
+	span.SetAttributes(database.DatabaseDriverKey.String(databaseName))
 
 	m.sourceName = sourceName
+	span.SetAttributes(source.SourceDriverKey.String(sourceName))
 
 	databaseDrv, err := database.Open(ctx, databaseURL)
 	if err != nil {
@@ -171,11 +226,14 @@ func NewWithSourceInstance(ctx context.Context, sourceName string, sourceInstanc
 // database instance. Use any string that can serve as an identifier during logging
 // as sourceName and databaseName. You are responsible for closing down
 // the underlying source and database client if necessary.
-func NewWithInstance(sourceName string, sourceInstance source.Driver, databaseName string, databaseInstance database.Driver) (*Migrate, error) {
+func NewWithInstance(ctx context.Context, sourceName string, sourceInstance source.Driver, databaseName string, databaseInstance database.Driver) (*Migrate, error) {
+	span := trace.SpanFromContext(ctx)
 	m := newCommon()
 
 	m.sourceName = sourceName
+	span.SetAttributes(source.SourceDriverKey.String(sourceName))
 	m.databaseName = databaseName
+	span.SetAttributes(database.DatabaseDriverKey.String(databaseName))
 
 	m.sourceDrv = sourceInstance
 	m.databaseDrv = databaseInstance
@@ -736,21 +794,31 @@ func (m *Migrate) runMigrations(ctx context.Context, ret <-chan interface{}) err
 
 		case *Migration:
 			migr := r
+			direction := "up"
+			if migr.TargetVersion < int(migr.Version) {
+				direction = "down"
+			}
+			attributes := []attribute.KeyValue{
+				MigrationIdentifierKey.String(migr.Identifier),
+				MigrationVersionKey.Int64(int64(migr.Version)),
+				MigrationDirectionKey.String(direction),
+			}
+			spanCtx := context.WithValue(ctx, database.ContextSpanAttributes, attributes)
 
 			// set version with dirty state
-			if err := m.databaseDrv.SetVersion(ctx, migr.TargetVersion, true); err != nil {
+			if err := m.databaseDrv.SetVersion(spanCtx, migr.TargetVersion, true); err != nil {
 				return err
 			}
 
 			if migr.Body != nil {
 				m.logVerbosePrintf("Read and execute %v\n", migr.LogString())
-				if err := m.databaseDrv.Run(ctx, migr.BufferedBody); err != nil {
+				if err := m.databaseDrv.Run(spanCtx, migr.BufferedBody); err != nil {
 					return err
 				}
 			}
 
 			// set clean state
-			if err := m.databaseDrv.SetVersion(ctx, migr.TargetVersion, false); err != nil {
+			if err := m.databaseDrv.SetVersion(spanCtx, migr.TargetVersion, false); err != nil {
 				return err
 			}
 

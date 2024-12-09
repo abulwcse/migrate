@@ -3,13 +3,14 @@ package github
 import (
 	"context"
 	"fmt"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"io"
 	"net/http"
 	nurl "net/url"
 	"os"
 	"path"
 	"strings"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"golang.org/x/oauth2"
 
@@ -59,7 +60,7 @@ func (g *Github) Open(ctx context.Context, url string) (source.Driver, error) {
 		ts := oauth2.StaticTokenSource(
 			&oauth2.Token{AccessToken: password},
 		)
-		client = oauth2.NewClient(context.Background(), ts)
+		client = oauth2.NewClient(ctx, ts)
 	}
 	instrumentedClient := &http.Client{Transport: otelhttp.NewTransport(client.Transport)}
 
@@ -82,7 +83,7 @@ func (g *Github) Open(ctx context.Context, url string) (source.Driver, error) {
 		gn.config.Path = strings.Join(pe[1:], "/")
 	}
 
-	if err := gn.readDirectory(); err != nil {
+	if err := gn.readDirectory(ctx); err != nil {
 		return nil, err
 	}
 
@@ -97,18 +98,18 @@ func WithInstance(ctx context.Context, client *github.Client, config *Config) (s
 		options:    &github.RepositoryContentGetOptions{Ref: config.Ref},
 	}
 
-	if err := gn.readDirectory(); err != nil {
+	if err := gn.readDirectory(ctx); err != nil {
 		return nil, err
 	}
 
 	return gn, nil
 }
 
-func (g *Github) readDirectory() error {
+func (g *Github) readDirectory(ctx context.Context) error {
 	g.ensureFields()
 
 	fileContent, dirContents, _, err := g.client.Repositories.GetContents(
-		context.Background(),
+		ctx,
 		g.config.Owner,
 		g.config.Repo,
 		g.config.Path,
@@ -180,7 +181,7 @@ func (g *Github) ReadUp(ctx context.Context, version uint) (r io.ReadCloser, ide
 
 	if m, ok := g.migrations.Up(version); ok {
 		r, _, err := g.client.Repositories.DownloadContents(
-			context.Background(),
+			ctx,
 			g.config.Owner,
 			g.config.Repo,
 			path.Join(g.config.Path, m.Raw),
@@ -200,7 +201,7 @@ func (g *Github) ReadDown(ctx context.Context, version uint) (r io.ReadCloser, i
 
 	if m, ok := g.migrations.Down(version); ok {
 		r, _, err := g.client.Repositories.DownloadContents(
-			context.Background(),
+			ctx,
 			g.config.Owner,
 			g.config.Repo,
 			path.Join(g.config.Path, m.Raw),

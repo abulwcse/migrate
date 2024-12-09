@@ -206,7 +206,7 @@ func TestNewWithInstance(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m, err := NewWithInstance(srcDrvNameStub, sInst, dbDrvNameStub, dbInst)
+	m, err := NewWithInstance(ctx, srcDrvNameStub, sInst, dbDrvNameStub, dbInst)
 	if err != nil {
 		t.Fatal(err)
 	}

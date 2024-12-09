@@ -4,11 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"net/http"
 	nurl "net/url"
 	"strconv"
 	"strings"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/golang-migrate/migrate/v4/source"
 	gh "github.com/golang-migrate/migrate/v4/source/github"

@@ -10,6 +10,8 @@ import (
 	"io"
 	nurl "net/url"
 	"sync"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 var driversMu sync.RWMutex
@@ -92,6 +94,32 @@ func Open(ctx context.Context, url string) (Driver, error) {
 	}
 
 	return d.Open(ctx, url)
+}
+
+// OpenInstrumented returns a new instrumented source driver instance.
+func OpenInstrumented(ctx context.Context, tracer trace.Tracer, url string) (Driver, error) {
+	span := trace.SpanFromContext(ctx)
+
+	u, err := nurl.Parse(url)
+	if err != nil {
+		return nil, err
+	}
+
+	if u.Scheme == "" {
+		return nil, fmt.Errorf("source driver: invalid URL scheme")
+	}
+	span.SetAttributes(SourceDriverKey.String(u.Scheme))
+
+	driversMu.RLock()
+	d, ok := drivers[u.Scheme]
+	driversMu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("source driver: unknown driver '%s' (forgotten import?)", u.Scheme)
+	}
+
+	instrumeted := NewInstrumentedDriver(d, u.Scheme, tracer)
+
+	return instrumeted.Open(ctx, url)
 }
 
 // Register globally registers a driver.

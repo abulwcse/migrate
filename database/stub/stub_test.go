@@ -2,10 +2,11 @@ package stub
 
 import (
 	"context"
+	"testing"
+
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/source"
 	"github.com/golang-migrate/migrate/v4/source/stub"
-	"testing"
 
 	dt "github.com/golang-migrate/migrate/v4/database/testing"
 )
@@ -37,7 +38,7 @@ func TestMigrate(t *testing.T) {
 		t.Fatal(err)
 	}
 	srcDrv.(*stub.Stub).Migrations = stubMigrations
-	m, err := migrate.NewWithInstance("stub", srcDrv, "", d)
+	m, err := migrate.NewWithInstance(ctx, "stub", srcDrv, "", d)
 	if err != nil {
 		t.Fatal(err)
 	}

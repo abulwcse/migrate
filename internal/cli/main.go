@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -14,6 +15,11 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database"
 	"github.com/golang-migrate/migrate/v4/source"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/sdk/resource"
+	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 )
 
 const (
@@ -34,6 +40,14 @@ const (
 	forceUsage = `force V      Set version V but don't run migration (ignores dirty state)`
 )
 
+const name = "github.com/golang-migrate/migrate/v4"
+
+var (
+	tracer = otel.Tracer(name)
+	// meter  = otel.Meter(name)
+	// logger = otellog.NewLogger(name)
+)
+
 func handleSubCmdHelp(help bool, usage string, flagSet *flag.FlagSet) {
 	if help {
 		fmt.Fprintln(os.Stderr, usage)
@@ -51,16 +65,16 @@ func newFlagSetWithHelp(name string) (*flag.FlagSet, *bool) {
 // set main log
 var log = &Log{}
 
-func printUsageAndExit() {
+func printUsageAndExit() int {
 	flag.Usage()
 
 	// If a command is not found we exit with a status 2 to match the behavior
 	// of flag.Parse() with flag.ExitOnError when parsing an invalid flag.
-	os.Exit(2)
+	return 2
 }
 
 // Main function of a cli application. It is public for backwards compatibility with `cli` package
-func Main(version string) {
+func Main(version string) int {
 	helpPtr := flag.Bool("help", false, "")
 	versionPtr := flag.Bool("version", false, "")
 	verbosePtr := flag.Bool("verbose", false, "")
@@ -106,13 +120,13 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 	// show cli version
 	if *versionPtr {
 		fmt.Fprintln(os.Stderr, version)
-		os.Exit(0)
+		return 0
 	}
 
 	// show help
 	if *helpPtr {
 		flag.Usage()
-		os.Exit(0)
+		return 0
 	}
 
 	// translate -path into -source if given
@@ -120,14 +134,50 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 		*sourcePtr = fmt.Sprintf("file://%v", *pathPtr)
 	}
 
+	ctx := context.Background()
+
+	// Set up OpenTelemetry.
+	res, err := resource.New(
+		ctx,
+		resource.WithAttributes(
+			semconv.ServiceNameKey.String("migrate"),
+			semconv.ServiceVersionKey.String(version),
+		),
+		resource.WithFromEnv(),      // Discover and provide attributes from OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME environment variables.
+		resource.WithTelemetrySDK(), // Discover and provide information about the OpenTelemetry SDK used.
+		resource.WithProcess(),      // Discover and provide process information.
+		resource.WithOS(),           // Discover and provide OS information.
+		resource.WithContainer(),    // Discover and provide container information.
+		resource.WithHost(),         // Discover and provide host information.
+	)
+	if errors.Is(err, resource.ErrPartialResource) || errors.Is(err, resource.ErrSchemaURLConflict) {
+		log.Println(err)
+	} else if err != nil {
+		return log.fatalErr(err)
+	}
+
+	otelShutdown, err := setupOTelSDK(ctx, res)
+	if err != nil {
+		return 1
+	}
+	// Handle shutdown properly so nothing leaks.
+	defer func() {
+		err = errors.Join(err, otelShutdown(context.Background()))
+	}()
+
+	ctx, span := tracer.Start(ctx, "Main")
+	defer span.End()
+
 	// initialize migrate
 	// don't catch migraterErr here and let each command decide
 	// how it wants to handle the error
-	ctx := context.Background()
-	migrater, migraterErr := migrate.New(ctx, *sourcePtr, *databasePtr)
+	migrater, migraterErr := migrate.NewInstrumented(ctx, tracer, *sourcePtr, *databasePtr)
+
 	defer func() {
 		if migraterErr == nil {
 			if _, err := migrater.Close(ctx); err != nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
 				log.Println(err)
 			}
 		}
@@ -152,7 +202,7 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 	startTime := time.Now()
 
 	if len(flag.Args()) < 1 {
-		printUsageAndExit()
+		return printUsageAndExit()
 	}
 	args := flag.Args()[1:]
 
@@ -171,27 +221,35 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 		createFlagSet.IntVar(&seqDigits, "digits", seqDigits, "The number of digits to use in sequences (default: 6)")
 
 		if err := createFlagSet.Parse(args); err != nil {
-			log.fatalErr(err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatalErr(err)
 		}
 
 		handleSubCmdHelp(*help, createUsage, createFlagSet)
 
 		if createFlagSet.NArg() == 0 {
-			log.fatal("error: please specify name")
+			span.SetStatus(codes.Error, "please specify name")
+			return log.fatal("error: please specify name")
 		}
 		name := createFlagSet.Arg(0)
 
 		if *extPtr == "" {
-			log.fatal("error: -ext flag must be specified")
+			span.SetStatus(codes.Error, "-ext flag must be specified")
+			return log.fatal("error: -ext flag must be specified")
 		}
 
 		timezone, err := time.LoadLocation(*timezoneName)
 		if err != nil {
-			log.fatal(err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatal(err)
 		}
 
-		if err := createCmd(*dirPtr, startTime.In(timezone), *formatPtr, name, *extPtr, seq, seqDigits, true); err != nil {
-			log.fatalErr(err)
+		if err := createCmd(ctx, *dirPtr, startTime.In(timezone), *formatPtr, name, *extPtr, seq, seqDigits, true); err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatalErr(err)
 		}
 
 	case "goto":
@@ -199,26 +257,35 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 		gotoSet, helpPtr := newFlagSetWithHelp("goto")
 
 		if err := gotoSet.Parse(args); err != nil {
-			log.fatalErr(err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatalErr(err)
 		}
 
 		handleSubCmdHelp(*helpPtr, gotoUsage, gotoSet)
 
 		if migraterErr != nil {
-			log.fatalErr(migraterErr)
+			span.RecordError(migraterErr)
+			span.SetStatus(codes.Error, migraterErr.Error())
+			return log.fatalErr(migraterErr)
 		}
 
 		if gotoSet.NArg() == 0 {
-			log.fatal("error: please specify version argument V")
+			span.SetStatus(codes.Error, "please specify version argument V")
+			return log.fatal("error: please specify version argument V")
 		}
 
 		v, err := strconv.ParseUint(gotoSet.Arg(0), 10, 64)
 		if err != nil {
-			log.fatal("error: can't read version argument V")
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatal("error: can't read version argument V")
 		}
 
 		if err := gotoCmd(ctx, migrater, uint(v)); err != nil {
-			log.fatalErr(err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatalErr(err)
 		}
 
 		if log.verbose {
@@ -229,26 +296,34 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 		upSet, helpPtr := newFlagSetWithHelp("up")
 
 		if err := upSet.Parse(args); err != nil {
-			log.fatalErr(err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatalErr(err)
 		}
 
 		handleSubCmdHelp(*helpPtr, upUsage, upSet)
 
 		if migraterErr != nil {
-			log.fatalErr(migraterErr)
+			span.RecordError(migraterErr)
+			span.SetStatus(codes.Error, migraterErr.Error())
+			return log.fatalErr(migraterErr)
 		}
 
 		limit := -1
 		if upSet.NArg() > 0 {
 			n, err := strconv.ParseUint(upSet.Arg(0), 10, 64)
 			if err != nil {
-				log.fatal("error: can't read limit argument N")
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				return log.fatal("error: can't read limit argument N")
 			}
 			limit = int(n)
 		}
 
 		if err := upCmd(ctx, migrater, limit); err != nil {
-			log.fatalErr(err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatalErr(err)
 		}
 
 		if log.verbose {
@@ -260,19 +335,25 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 		applyAll := downFlagSet.Bool("all", false, "Apply all down migrations")
 
 		if err := downFlagSet.Parse(args); err != nil {
-			log.fatalErr(err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatalErr(err)
 		}
 
 		handleSubCmdHelp(*helpPtr, downUsage, downFlagSet)
 
 		if migraterErr != nil {
-			log.fatalErr(migraterErr)
+			span.RecordError(migraterErr)
+			span.SetStatus(codes.Error, migraterErr.Error())
+			return log.fatalErr(migraterErr)
 		}
 
 		downArgs := downFlagSet.Args()
 		num, needsConfirm, err := numDownMigrationsFromArgs(*applyAll, downArgs)
 		if err != nil {
-			log.fatalErr(err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatalErr(err)
 		}
 		if needsConfirm {
 			log.Println("Are you sure you want to apply all down migrations? [y/N]")
@@ -283,12 +364,14 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 			if response == "y" {
 				log.Println("Applying all down migrations")
 			} else {
-				log.fatal("Not applying all down migrations")
+				return log.fatal("Not applying all down migrations")
 			}
 		}
 
 		if err := downCmd(ctx, migrater, num); err != nil {
-			log.fatalErr(err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatalErr(err)
 		}
 
 		if log.verbose {
@@ -300,7 +383,9 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 		forceDrop := dropFlagSet.Bool("f", false, "Force the drop command by bypassing the confirmation prompt")
 
 		if err := dropFlagSet.Parse(args); err != nil {
-			log.fatalErr(err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatalErr(err)
 		}
 
 		handleSubCmdHelp(*help, dropUsage, dropFlagSet)
@@ -314,16 +399,20 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 			if response == "y" {
 				log.Println("Dropping the entire database schema")
 			} else {
-				log.fatal("Aborted dropping the entire database schema")
+				return log.fatal("Aborted dropping the entire database schema")
 			}
 		}
 
 		if migraterErr != nil {
-			log.fatalErr(migraterErr)
+			span.RecordError(migraterErr)
+			span.SetStatus(codes.Error, migraterErr.Error())
+			return log.fatalErr(migraterErr)
 		}
 
 		if err := dropCmd(ctx, migrater); err != nil {
-			log.fatalErr(err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatalErr(err)
 		}
 
 		if log.verbose {
@@ -334,30 +423,40 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 		forceSet, helpPtr := newFlagSetWithHelp("force")
 
 		if err := forceSet.Parse(args); err != nil {
-			log.fatalErr(err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatalErr(err)
 		}
 
 		handleSubCmdHelp(*helpPtr, forceUsage, forceSet)
 
 		if migraterErr != nil {
-			log.fatalErr(migraterErr)
+			span.RecordError(migraterErr)
+			span.SetStatus(codes.Error, migraterErr.Error())
+			return log.fatalErr(migraterErr)
 		}
 
 		if forceSet.NArg() == 0 {
-			log.fatal("error: please specify version argument V")
+			span.SetStatus(codes.Error, "please specify version argument V")
+			return log.fatal("error: please specify version argument V")
 		}
 
 		v, err := strconv.ParseInt(forceSet.Arg(0), 10, 64)
 		if err != nil {
-			log.fatal("error: can't read version argument V")
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatal("error: can't read version argument V")
 		}
 
 		if v < -1 {
-			log.fatal("error: argument V must be >= -1")
+			span.SetStatus(codes.Error, "argument V must be >= -1")
+			return log.fatal("error: argument V must be >= -1")
 		}
 
 		if err := forceCmd(ctx, migrater, int(v)); err != nil {
-			log.fatalErr(err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatalErr(err)
 		}
 
 		if log.verbose {
@@ -366,14 +465,20 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 
 	case "version":
 		if migraterErr != nil {
-			log.fatalErr(migraterErr)
+			span.RecordError(migraterErr)
+			span.SetStatus(codes.Error, migraterErr.Error())
+			return log.fatalErr(migraterErr)
 		}
 
 		if err := versionCmd(ctx, migrater); err != nil {
-			log.fatalErr(err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return log.fatalErr(err)
 		}
 
 	default:
-		printUsageAndExit()
+		return printUsageAndExit()
 	}
+
+	return 0
 }

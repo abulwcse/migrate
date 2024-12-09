@@ -34,11 +34,11 @@ func (l *Log) Verbose() bool {
 	return l.verbose
 }
 
-func (l *Log) fatal(args ...interface{}) {
+func (l *Log) fatal(args ...interface{}) int {
 	l.Println(args...)
-	os.Exit(1)
+	return 1
 }
 
-func (l *Log) fatalErr(err error) {
-	l.fatal("error:", err)
+func (l *Log) fatalErr(err error) int {
+	return l.fatal("error:", err)
 }

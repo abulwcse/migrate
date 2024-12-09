@@ -11,6 +11,8 @@ import (
 	"sync"
 
 	iurl "github.com/golang-migrate/migrate/v4/internal/url"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -97,6 +99,28 @@ func Open(ctx context.Context, url string) (Driver, error) {
 	}
 
 	return d.Open(ctx, url)
+}
+
+// OpenInstrumented returns a new instrumented driver instance.
+func OpenInstrumented(ctx context.Context, tracer trace.Tracer, url string) (Driver, error) {
+	span := trace.SpanFromContext(ctx)
+
+	scheme, err := iurl.SchemeFromURL(url)
+	if err != nil {
+		return nil, err
+	}
+	span.SetAttributes(DatabaseDriverKey.String(scheme))
+
+	driversMu.RLock()
+	d, ok := drivers[scheme]
+	driversMu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("database driver: unknown driver %v (forgotten import?)", scheme)
+	}
+
+	instrumented := NewInstrumentedDriver(d, scheme, tracer)
+
+	return instrumented.Open(ctx, url)
 }
 
 // Register globally registers a driver.

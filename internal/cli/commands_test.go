@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -231,7 +232,7 @@ func (s *CreateCmdSuite) TestCreateCmd() {
 				dir = filepath.Join(baseDir, dir)
 			}
 
-			err := createCmd(dir, c.startTime, c.format, c.name, c.ext, c.seq, c.seqDigits, false)
+			err := createCmd(context.Background(), dir, c.startTime, c.format, c.name, c.ext, c.seq, c.seqDigits, false)
 
 			if c.expectedErr != nil {
 				s.EqualError(err, c.expectedErr.Error())
